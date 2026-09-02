@@ -257,6 +257,7 @@ function parseWithStatus (uri, opts) {
 
   let malformedAuthorityOrPort = false
   let malformedHost = false
+  let malformedIPLiteral = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -328,9 +329,16 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
+        const bracketedIPLiteral = parsed.host[0] === '[' && parsed.host[parsed.host.length - 1] === ']'
         const ipv6result = normalizeIPv6(parsed.host)
-        parsed.host = ipv6result.host.toLowerCase()
-        isIP = ipv6result.isIPV6
+        isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
+        malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true
+        parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
+
+        if (malformedIPLiteral) {
+          parsed.error = parsed.error || 'URI host is malformed.'
+          malformedAuthorityOrPort = true
+        }
       } else {
         isIP = true
       }
@@ -355,8 +363,11 @@ function parseWithStatus (uri, opts) {
 
     // check if scheme can't handle IRIs
     if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport)) {
-      // if host component is a domain name
-      if (parsed.host && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && isIP === false && nonSimpleDomain(parsed.host)) {
+      // if host component is a domain name. A bracketed IP literal (RFC 3986
+      // `IP-literal`) is never a domain name: normalizeIPv6 already validated
+      // it, so it must not be re-parsed as an IDN. An unterminated "[" is not
+      // an IP literal and still has to be validated as a reg-name.
+      if (parsed.host && !(parsed.host[0] === '[' && parsed.host[parsed.host.length - 1] === ']') && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && isIP === false && nonSimpleDomain(parsed.host)) {
         // convert Unicode IDN -> ASCII IDN
         try {
           parsed.host = new URL('http://' + parsed.host).hostname
@@ -373,11 +384,12 @@ function parseWithStatus (uri, opts) {
         if (parsed.scheme !== undefined) {
           parsed.scheme = unescape(parsed.scheme)
         }
-        if (parsed.host !== undefined) {
+        if (parsed.host !== undefined && !malformedIPLiteral) {
           // Decode only current unreserved escapes, once. Using unescape() here
           // decodes every escape and lets a nested escape (e.g. %252e -> %2e -> .)
           // reparse as a live delimiter, redirecting to a different host.
-          parsed.host = reescapeHostDelimiters(normalizePercentEncoding(parsed.host, true), isIP)
+          const host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true)
+          parsed.host = reescapeHostDelimiters(host, isIP)
         }
       }
       if (parsed.path) {
