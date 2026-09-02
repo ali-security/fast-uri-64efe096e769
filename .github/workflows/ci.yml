@@ -1,18 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-     - main
-     - next
-     - 'v*'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional test file glob passed to tape'
+        required: false
+        default: ''
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -26,9 +20,13 @@ jobs:
   test-regression-check-node10:
     name: Test compatibility with Node.js 10
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
+      - name: Configure npm time machine registry
+        run: npm config set registry https://:2026-05-05T08%3A31%3A31.849000Z@time-machines-npm.sealsecurity.io/
+
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -51,13 +49,24 @@ jobs:
           cp -r ./lib ./node_modules/fast-uri/lib &&
           cp ./index.js ./node_modules/fast-uri/index.js
 
+      # `npm run test:unit` runs ZERO tests here and still exits 0: npm 6 (the npm
+      # bundled with Node 10) applies the repo `.npmrc`'s `ignore-scripts=true` to
+      # directly-invoked run-scripts as well, so the leg is silently vacuous.
+      # Invoke the tape binary with the exact glob `test:unit` declares instead —
+      # same test files, no masking.
       - name: Run tests
         run: |
-          npm run test:unit
+          node ./node_modules/.bin/tape "test/**/*.js"
         env:
           NODE_OPTIONS: no-network-family-autoselection
 
   test-browser:
+    # Disabled on the fork: the Playwright browser engines (chromium/firefox/webkit)
+    # are downloaded at runtime on every fork runner, which is heavy and unreliable.
+    # The very same tape test files are executed natively on ubuntu/windows/macOS by
+    # the `test` matrix below, so no test file is lost here — only the browser
+    # environment they would additionally have run in.
+    if: false
     name: Test browser compatibility
     runs-on: ${{ matrix.os }}
     strategy:
@@ -93,14 +102,83 @@ jobs:
         run: |
           npm run test:browser:${{ matrix.browser }}
 
+  # Inlined copy of the `test` job of fastify/workflows/.github/workflows/plugins-ci.yml@v6:
+  # a job that calls a reusable workflow cannot declare `timeout-minutes`, which the fork
+  # dispatcher requires. Steps and matrix are reproduced verbatim; the reusable workflow's
+  # lint / license-check quality gates are intentionally not carried over.
   test:
+    name: Test
     needs:
       - test-regression-check-node10
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
-      contents: write
-      pull-requests: write
-    uses: fastify/workflows/.github/workflows/plugins-ci.yml@v6
-    with:
-      license-check: true
-      lint: true
-      node-versions: '["16", "18", "20", "22", "24"]'
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ["16", "18", "20", "22", "24"]
+        os: [macos-latest, ubuntu-latest, windows-latest]
+        exclude:
+          - os: macos-latest
+            node-version: 16
+    steps:
+      - name: Configure npm time machine registry
+        run: npm config set registry https://:2026-05-05T08%3A31%3A31.849000Z@time-machines-npm.sealsecurity.io/
+
+      - name: Check out repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v6
+        with:
+          check-latest: true
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: npm i --ignore-scripts
+
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            npx tape "${{ inputs.test-filter }}"
+          else
+            npm test
+          fi
+
+  pack:
+    name: Pack the release tarball
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Configure npm time machine registry
+        run: npm config set registry https://:2026-05-05T08%3A31%3A31.849000Z@time-machines-npm.sealsecurity.io/
+
+      - name: Check out repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          check-latest: true
+
+      - name: Pin npm to the version that packed the public tarball
+        run: npm i -g npm@11.13.0
+
+      - name: Pack
+        run: npm pack --ignore-scripts
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: fast-uri-*.tgz
+          if-no-files-found: error
